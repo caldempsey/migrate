@@ -28,7 +28,7 @@ func init() {
 var (
 	multiStmtDelimiter = []byte(";")
 
-	DefaultMigrationsTable       = "schema_migrations"
+	DefaultMigrationsTable       = "`hive_metastore`.default.schema_migrations"
 	DefaultMultiStatementMaxSize = 10 * 1 << 20 // 10 MB
 )
 
@@ -153,19 +153,33 @@ func (d *SQLWarehouse) runStatement(statement []byte) error {
 }
 
 func (d *SQLWarehouse) SetVersion(version int, dirty bool) error {
-	// Transactions are not supported yet, so we will manually clear and insert the version.
+	// Begin a transaction
+	tx, err := d.db.BeginTx(context.Background(), &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("transaction start failed: %w", err)
+	}
 
-	// First, truncate the migrations table to remove any existing records.
+	// Step 1: Truncate the migrations table to remove any existing records
 	query := `TRUNCATE TABLE ` + d.config.MigrationsTable
-	if _, err := d.db.ExecContext(context.Background(), query); err != nil {
+	if _, err := tx.Exec(query); err != nil {
+		if errRollback := tx.Rollback(); errRollback != nil {
+			err = fmt.Errorf("rollback failed: %v", errRollback)
+		}
 		return fmt.Errorf("failed to truncate migration table: %w", err)
 	}
 
-	// Then, insert the new migration version and dirty flag.
-	// Since Databricks SQL doesn't support positional parameters (`?`), we'll insert the values directly into the query.
-	query = fmt.Sprintf(`INSERT INTO %s (version, dirty) VALUES (%d, %t)`, d.config.MigrationsTable, version, dirty)
-	if _, err := d.db.ExecContext(context.Background(), query); err != nil {
+	// Step 2: Insert the new migration version and dirty flag using positional placeholders
+	query = `INSERT INTO ` + d.config.MigrationsTable + ` (version, dirty) VALUES (?, ?)`
+	if _, err := tx.Exec(query, version, dirty); err != nil {
+		if errRollback := tx.Rollback(); errRollback != nil {
+			err = fmt.Errorf("rollback failed: %v", errRollback)
+		}
 		return fmt.Errorf("failed to insert version into migration table: %w", err)
+	}
+
+	// Step 3: Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("transaction commit failed: %w", err)
 	}
 
 	return nil
